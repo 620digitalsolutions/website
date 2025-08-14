@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 620 Digital Solutions static site (S3 + CloudFront + optional custom domain)
+Transform:
+  - AWS::Serverless-2016-10-31
+
+Parameters:
+  FunctionLogFormat:
+    Type: String
+    Default: JSON
+
+  RootDomain:
+    Type: String
+    Default: 620digitalsolutions.net
+
+  EnableCustomDomain:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'false'
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route 53 hosted zone ID for RootDomain (required when EnableCustomDomain=true)
+
+  CloudFrontHostedZoneId:
+    Type: String
+    Default: Z2FDTNDATAQYW2
+    Description: Global CloudFront hosted zone ID (rarely changes)
+
+  WebAppBucketName:
+    Type: String
+    Default: 620digitalsolutions-site-bucket
+    Description: S3 bucket for site assets (must be globally unique)
+
+Conditions:
+  UseCustomDomain: !Equals [!Ref EnableCustomDomain, 'true']
+  HasHostedZone:   !Not [!Equals [!Ref HostedZoneId, '']]
+  UseCustomDomainWithZone: !And [!Condition UseCustomDomain, !Condition HasHostedZone]
+
+Resources:
+  WebAppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref WebAppBucketName
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  WebAppOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: 620ds-app-oac
+        Description: Access control for CloudFront to reach S3 bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebAppCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref RootDomain
+      ValidationMethod: DNS
+      DomainValidationOptions: !If
+        - HasHostedZone
+        - - DomainName: !Ref RootDomain
+            HostedZoneId: !Ref HostedZoneId
+        - !Ref AWS::NoValue
+
+  WebAppCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: 620 Digital Solutions static site
+        Origins:
+          - Id: WebAppOrigin
+            DomainName: !GetAtt WebAppBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !Ref WebAppOriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: WebAppOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: ["GET", "HEAD"]
+          CachedMethods: ["GET", "HEAD"]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate: !If
+          - UseCustomDomain
+          - {
+              "AcmCertificateArn": { "Ref": "WebAppCertificate" },
+              "SslSupportMethod": "sni-only",
+              "MinimumProtocolVersion": "TLSv1.2_2021"
+            }
+          - { "CloudFrontDefaultCertificate": true }
+        Aliases: !If
+          - UseCustomDomain
+          - [ !Ref RootDomain ]
+          - []
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponsePagePath: /index.html
+            ResponseCode: 200
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponsePagePath: /index.html
+            ResponseCode: 200
+            ErrorCachingMinTTL: 0
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+
+  WebAppBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebAppBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${WebAppBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebAppCloudFrontDistribution}"
+
+  WebAppDNSRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: UseCustomDomainWithZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref RootDomain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt WebAppCloudFrontDistribution.DomainName
+        HostedZoneId: !Ref CloudFrontHostedZoneId
+
+  WebAppDNSRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: UseCustomDomainWithZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref RootDomain
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt WebAppCloudFrontDistribution.DomainName
+        HostedZoneId: !Ref CloudFrontHostedZoneId
+
+Outputs:
+  BucketName:
+    Value: !Ref WebAppBucket
+    Export:
+      Name: !Sub '${AWS::StackName}:BucketName'
+  DistributionId:
+    Value: !Ref WebAppCloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}:DistributionId'
+  CloudFrontDomain:
+    Value: !GetAtt WebAppCloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}:CloudFrontDomain'
